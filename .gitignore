@@ -122,3 +122,4 @@ venv.bak/
 *.bz2
 *.xz
 test_*.txt
+project_analysis/
