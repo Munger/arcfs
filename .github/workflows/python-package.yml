@@ -1,0 +1,55 @@
+# Author: Tim Hosking (GitHub: Munger)
+# Contact: https://github.com/Munger
+# License: MIT
+
+
+name: Python package
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: [3.7, 3.8, 3.9, '3.10']
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install pytest pytest-cov black isort mypy pylint
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .[dev]
+    - name: Lint with pylint
+      run: |
+        pylint arcfs tests
+    - name: Format check with black
+      run: |
+        black --check .
+    - name: Check imports with isort
+      run: |
+        isort --check .
+    - name: Type check with mypy
+      run: |
+        mypy arcfs
+    - name: Test with pytest
+      run: |
+        pytest --cov=arcfs
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        file: ./coverage.xml
+        fail_ci_if_error: false
