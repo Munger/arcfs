@@ -1,9 +1,5 @@
 # ArcFS: Transparent Archive File System
 
-**Author**: Tim Hosking (GitHub: [Munger](https://github.com/Munger))
-**License**: MIT
-
-
 ArcFS is a Python library that allows you to work with archives as if they were directories. It provides a seamless way to read, write, and manage files within archives without manually handling compression or decompression.
 
 ## Features
@@ -435,17 +431,31 @@ Returns:
 
 ### Configuration
 
-#### `configure(max_buffer_size=None, temp_dir=None)`
-Configures global library settings.
+#### `config()`
+Returns the configuration manager for ArcFS, allowing you to get and set global or handler-specific options.
 
 ```python
-# Set memory limits and temporary directory
-fs.configure(max_buffer_size=100*1024*1024, temp_dir="/tmp/arcfs")
+# Set global memory buffer size
+fs.config().global_buffer_size.set(100*1024*1024)
+
+# Set temporary directory for large files
+fs.config().temp_dir.set("/tmp/arcfs")
+
+# Set buffer size for ZIP archives only
+fs.config().zip.buffer_size.set(8 * 1024 * 1024)  # 8MB buffer for ZIP
+
+# Set buffer size for TAR archives only
+fs.config().tar.buffer_size.set(32 * 1024 * 1024)  # 32MB buffer for TAR
+
+# Get current buffer size for GZIP handler
+print(fs.config().gzip.buffer_size.get())
 ```
 
 Parameters:
-- `max_buffer_size` (int): Maximum size for in-memory buffers
-- `temp_dir` (str): Directory for temporary files (if needed)
+- Use `.global_buffer_size` and `.temp_dir` for global settings.
+- Use `.zip`, `.tar`, `.gzip`, `.bzip2`, `.xz` for handler-specific settings.
+
+See the codebase or API docs for all available options.
 
 #### `set_archive_handler(extension, handler_class)`
 Registers custom handler for specific archive format.
@@ -570,6 +580,8 @@ for root, dirs, files in fs.walk("huge_archive.tar.gz"):
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Author: Tim Hosking - https://github.com/Munger
 
 ## License
 

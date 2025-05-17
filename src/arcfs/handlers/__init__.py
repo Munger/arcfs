@@ -7,5 +7,9 @@ Contact: https://github.com/Munger
 License: MIT
 """
 
-# Handlers will be imported and registered by the main __init__.py
+from .zip_handler import *
+from .bzip2_handler import *
+from .xz_handler import *
+from .tar_handler import *
+from .gzip_handler import *
 __all__ = []

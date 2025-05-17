@@ -7,470 +7,489 @@ Contact: https://github.com/Munger
 License: MIT
 """
 
-import os
 import io
 import tarfile
-from typing import Dict, List, Optional, BinaryIO, Any, Set
 import tempfile
 
-from ..archive_handlers import ArchiveHandler, ArchiveEntry
-from ..utils import get_archive_format
+import time
+import platform
+from typing import Dict, List, Optional, BinaryIO, Any, Set
+from datetime import datetime
 
 
-class TarEntryStream(io.BytesIO):
+# Utility function for archive format and compression selection
+
+def get_archive_format(path: str) -> str:
     """
-    Stream wrapper for TAR entries.
-    Handles reading and writing to entries in a TAR archive.
+    Extracts the extension from the archive path (e.g., '.tar.gz', '.tar.bz2', etc.)
     """
-    
-    def __init__(self, tar_file: tarfile.TarFile, entry_name: str, mode: str):
-        """
-        Initialize a TAR entry stream.
-        
-        Args:
-            tar_file: Parent TAR file
-            entry_name: Name of the entry in the TAR
-            mode: Access mode
-        """
+    import os
+    base = os.path.basename(path)
+    # Recognize .tar.gz, .tar.bz2, .tar.xz, etc.
+    for ext in ('.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz', '.tar'):
+        if base.endswith(ext):
+            return ext
+    # fallback to last extension
+    return os.path.splitext(base)[1]
+
+def get_tar_compression(ext: str) -> str:
+    mapping = {
+        ('.gz', '.tgz'): ':gz',
+        ('.bz2', '.tbz2'): ':bz2',
+        ('.xz', '.txz'): ':xz',
+    }
+    for exts, comp in mapping.items():
+        if any(ext.endswith(e) for e in exts):
+            return comp
+    return ''
+
+from arcfs.api.config_api import ConfigAPI
+from arcfs.core.base_handler import ArchiveHandler
+from arcfs.core.logging import debug_print
+
+
+class TarStream:
+    """
+    A stream for reading or writing a TAR archive member.
+
+    This class provides a file-like interface for reading or writing a TAR archive member.
+    All file operations are performed via the ARCFS file API and are agnostic to how files are buffered or stored.
+
+    Attributes:
+        tar_file (tarfile.TarFile): The TAR archive file.
+        member (tarfile.TarInfo): The TAR archive member.
+        mode (str): The mode for reading or writing the member.
+        _closed (bool): Whether the stream is closed.
+        _write_mode (bool): Whether the stream is in write mode.
+        handler (TarHandler): The TarHandler instance that created this stream.
+    """
+
+    def __init__(self, tar_file: tarfile.TarFile, member: tarfile.TarInfo, mode: str, buffer_threshold: Optional[int] = None, handler=None):
         self.tar_file = tar_file
-        self.entry_name = entry_name
+        self.member = member
         self.mode = mode
-        self.closed = False
-        self.temp_file = None
-        
-        # Initialize with data if reading
+        # Use handler config or config API for buffer threshold
+        if buffer_threshold is not None:
+            self._buffer_threshold = buffer_threshold
+        elif handler and hasattr(handler, 'config') and hasattr(handler.config, 'buffer_size'):
+            self._buffer_threshold = handler.config.buffer_size
+        else:
+            # Fallback: use ConfigAPI or a reasonable default (e.g., 64*1024)
+            try:
+                self._buffer_threshold = getattr(ConfigAPI, 'get_buffer_threshold', lambda: 64*1024)()
+            except Exception:
+                self._buffer_threshold = 64 * 1024
+        self._closed = False
+        self._write_mode = 'w' in mode or 'a' in mode
+        self.handler = handler
         if 'r' in mode and not 'w' in mode:
             try:
-                # Get the entry from the TAR
-                entry = tar_file.getmember(entry_name)
-                
-                # Check if it's a directory
-                if entry.isdir():
-                    raise IsADirectoryError(f"Cannot open directory as file: {entry_name}")
-                
-                # Extract the file to a buffer
-                file_obj = tar_file.extractfile(entry)
-                if file_obj is None:
-                    raise FileNotFoundError(f"Cannot open entry in TAR: {entry_name}")
-                
-                data = file_obj.read()
-                super().__init__(data)
-                
-            except KeyError:
-                # Entry doesn't exist
-                raise FileNotFoundError(f"Entry not found in TAR: {entry_name}")
+                fileobj = tar_file.extractfile(member)
+                data = fileobj.read() if fileobj else b''
+                # Use handler.fs.files for buffer management
+                self._buffer = self.handler.fs.files.open(path=None, mode='r+b', buffering=-1, encoding=None)
+                self._buffer.write(data)
+                self._buffer.seek(0)
+            except Exception as e:
+                raise IOError(f"Error extracting member from TAR archive: {e}")
         else:
-            # Create empty buffer for writing
-            super().__init__()
-    
+            # Use handler.fs.files for buffer management
+            self._buffer = self.handler.fs.files.open(path=None, mode='w+b', buffering=-1, encoding=None)
+
+    def write(self, b):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        return self._buffer.write(b)
+
+    def read(self, size: int = -1):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        return self._buffer.read(size)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        return self._buffer.seek(offset, whence)
+
     def close(self):
-        """Close the stream, writing data back to the TAR if in write mode."""
-        if self.closed:
+        if self._closed:
             return
-            
-        # If in write mode, write the data back to the TAR
-        if 'w' in self.mode or 'a' in self.mode:
-            # TAR files don't support direct modification of entries
-            # We would need to create a new TAR file, which is complex
-            # For now, we'll rely on the temp file approach in the handler
-            pass
-        
-        # Mark as closed and call parent close
-        self.closed = True
-        super().close()
+        self._closed = True
+        self._buffer.close()
+
+class TarConfig:
+    _overrides = {}
+
+    @classmethod
+    def set(cls, key, value):
+        cls._overrides[key] = value
+
+    @classmethod
+    def get(cls, key):
+        if key in cls._overrides:
+            return cls._overrides[key]
+        from arcfs.core.global_config import GlobalConfig
+        return GlobalConfig.get(key)
+
+    @classmethod
+    def reset(cls, key=None):
+        if key is None:
+            cls._overrides.clear()
+        else:
+            cls._overrides.pop(key, None)
 
 
 class TarHandler(ArchiveHandler):
-    """
-    Handler for TAR format archives, including compressed variants.
-    """
-    
-    def __init__(self, path: str, mode: str = 'r'):
-        """
-        Initialize the TAR handler.
-        
-        Args:
-            path: Path to the TAR file
-            mode: Access mode
-        """
-        self.path = path
-        self.mode = mode
-        self.tar_file = None
-        self.temp_dir = None
-        self.modified = False
-        self._open()
-    
-    def _open(self) -> None:
-        """Open the TAR file."""
-        # Determine the mode and compression
-        tar_mode = 'r'
-        if 'w' in self.mode:
-            tar_mode = 'w'
-        elif 'a' in self.mode:
-            tar_mode = 'a'
-        
-        # Add compression mode based on extension
-        ext = get_archive_format(self.path)
-        if ext.endswith('.gz') or ext.endswith('.tgz'):
-            tar_mode += ':gz'
-        elif ext.endswith('.bz2') or ext.endswith('.tbz2'):
-            tar_mode += ':bz2'
-        elif ext.endswith('.xz') or ext.endswith('.txz'):
-            tar_mode += ':xz'
-        
-        # Create the directory if writing and it doesn't exist
-        if tar_mode.startswith('w') and not os.path.exists(os.path.dirname(self.path)):
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        
-        # Open the TAR file
-        self.tar_file = tarfile.open(self.path, tar_mode)
-        
-        # Create a temporary directory for modifications
-        if 'w' in self.mode or 'a' in self.mode:
-            self.temp_dir = tempfile.mkdtemp()
-    
-    def close(self) -> None:
-        """Close the TAR file, applying any pending changes."""
+    config = TarConfig
+
+    # Implement required abstract methods with correct names/signatures
+    def entry_exists(self, path: str) -> bool:
+        return self.member_exists(path)
+
+    def get_entry_info(self, path: str) -> Optional[dict]:
+        return self.get_member_info(path)
+
+    def remove_entry(self, path: str) -> None:
+        return self.remove_member(path)
+
+    def open_entry(self, path: str, mode: str = 'r'):
+        return self.open_member(path, mode)
+
+    def list_entries(self) -> list:
+        # Return a list of ArchiveEntry for all members in the archive
+        entries = []
         if self.tar_file:
-            self.tar_file.close()
-            self.tar_file = None
-            
-            # If there are pending changes, rebuild the TAR file
-            if self.modified and self.temp_dir:
-                self._rebuild_tar()
-            
-            # Clean up temporary directory
-            if self.temp_dir:
-                import shutil
-                shutil.rmtree(self.temp_dir, ignore_errors=True)
-                self.temp_dir = None
-    
-    def _rebuild_tar(self) -> None:
-        """Rebuild the TAR file with modifications."""
-        # Determine the mode and compression for the new TAR
-        tar_mode = 'w'
-        ext = get_archive_format(self.path)
-        if ext.endswith('.gz') or ext.endswith('.tgz'):
-            tar_mode += ':gz'
-        elif ext.endswith('.bz2') or ext.endswith('.tbz2'):
-            tar_mode += ':bz2'
-        elif ext.endswith('.xz') or ext.endswith('.txz'):
-            tar_mode += ':xz'
-        
-        # Create a temporary file for the new TAR
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_path = temp_file.name
-        
+            for member in self.tar_file.getmembers():
+                entries.append(
+                    ArchiveEntry(
+                        path=member.name,
+                        size=member.size,
+                        modified=member.mtime,
+                        is_dir=member.isdir()
+                    )
+                )
+        # Add staged files not yet in tar_file
+        for arc_path, buf in self.staged_files.items():
+            if arc_path not in self.deleted_files:
+                entries.append(
+                    ArchiveEntry(
+                        path=arc_path,
+                        size=buf.getbuffer().nbytes if hasattr(buf, 'getbuffer') else 0,
+                        modified=int(time.time()),
+                        is_dir=False
+                    )
+                )
+        # Remove deleted files from list
+        entries = [e for e in entries if e.path not in self.deleted_files]
+        return entries
+
+
+
+    # --- Required abstract methods for ArchiveHandler ---
+    def stream_exists(self, arc_path: str) -> bool:
+        return self.member_exists(arc_path)
+
+    def get_stream_info(self, arc_path: str):
+        # For now, just return None if not found, else provide basic info
+        if not self.member_exists(arc_path):
+            return None
         try:
-            # Create the new TAR file
-            with tarfile.open(temp_path, tar_mode) as new_tar:
-                # Add all files from the temporary directory
-                for root, dirs, files in os.walk(self.temp_dir):
-                    for dir_name in dirs:
-                        dir_path = os.path.join(root, dir_name)
-                        arcname = os.path.relpath(dir_path, self.temp_dir)
-                        new_tar.add(dir_path, arcname=arcname)
-                    
-                    for file_name in files:
-                        file_path = os.path.join(root, file_name)
-                        arcname = os.path.relpath(file_path, self.temp_dir)
-                        new_tar.add(file_path, arcname=arcname)
-            
-            # Replace the old file with the new one
-            import shutil
-            shutil.move(temp_path, self.path)
-            
-        finally:
-            # Clean up the temporary file if it still exists
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-    
-    def list_entries(self) -> List[ArchiveEntry]:
-        """
-        List all entries in the TAR.
-        
-        Returns:
-            List of ArchiveEntry objects
-        """
-        result = []
-        
-        # Get info for all entries
-        for member in self.tar_file.getmembers():
-            # Create entry object
-            entry = ArchiveEntry(
-                path=member.name,
-                size=member.size,
-                modified=member.mtime,
-                is_dir=member.isdir()
-            )
-            
-            result.append(entry)
-        
-        return result
-    
-    def list_dir(self, path: str) -> List[str]:
-        """
-        List contents of a directory in the TAR.
-        
-        Args:
-            path: Directory path within the TAR
-            
-        Returns:
-            List of entry names in the directory
-        """
-        # Normalize path to not include trailing slash
-        if path.endswith('/'):
-            path = path[:-1]
-        
-        # Get all entries in the TAR
-        entries = set()
-        
-        for member in self.tar_file.getmembers():
-            # Skip entries not in this directory
-            member_path = member.name
-            
-            # Skip the directory itself
-            if member_path == path:
-                continue
-            
-            # Check if the member is in the requested directory
-            if path:
-                if not member_path.startswith(path + '/'):
-                    continue
-                
-                # Get the relative path from the directory
-                rel_path = member_path[len(path) + 1:]
-            else:
-                rel_path = member_path
-            
-            # Skip empty names
-            if not rel_path:
-                continue
-            
-            # Get only the first component
-            if '/' in rel_path:
-                dir_name = rel_path.split('/', 1)[0]
-                entries.add(dir_name)
-            else:
-                entries.add(rel_path)
-        
-        # Convert to list and sort
-        return sorted(entries)
-    
-    def open_entry(self, path: str, mode: str = 'r') -> BinaryIO:
-        """
-        Open an entry for reading or writing.
-        
-        Args:
-            path: Entry path within the TAR
-            mode: Access mode
-            
-        Returns:
-            File-like object for the entry
-        """
-        # Normalize the entry path
-        if not path:
-            raise ValueError("Entry path cannot be empty")
-            
-        # Check if it's a directory
-        if path.endswith('/'):
-            raise IsADirectoryError(f"Cannot open directory as file: {path}")
-        
-        # For write mode, we need special handling
-        if 'w' in mode or 'a' in mode:
-            # Make sure we have a temp directory
-            if not self.temp_dir:
-                self.temp_dir = tempfile.mkdtemp()
-            
-            # Create the full path in the temp directory
-            temp_path = os.path.join(self.temp_dir, path)
-            
-            # Ensure parent directories exist
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-            
-            # For append mode, copy the existing content if it exists
-            if 'a' in mode and not 'w' in mode:
-                try:
-                    # Get the existing content
-                    with TarEntryStream(self.tar_file, path, 'r') as src:
-                        with open(temp_path, 'wb') as dst:
-                            dst.write(src.read())
-                except FileNotFoundError:
-                    # Entry doesn't exist, that's fine for append mode
-                    pass
-            
-            # Mark as modified
-            self.modified = True
-            
-            # Open the temp file with the requested mode
-            return open(temp_path, mode)
-        
-        # For read mode, use the TarEntryStream
-        return TarEntryStream(self.tar_file, path, mode)
-    
-    def get_entry_info(self, path: str) -> Optional[Dict[str, Any]]:
-        """
-        Get information about an entry.
-        
-        Args:
-            path: Entry path within the TAR
-            
-        Returns:
-            Dictionary with entry information, or None if entry doesn't exist
-        """
-        # Handle root directory
-        if not path:
-            return {
-                'size': 0,
-                'modified': os.path.getmtime(self.path),
-                'is_dir': True,
-                'path': path
-            }
-        
-        # Normalize path
-        norm_path = path.rstrip('/')
-        
-        try:
-            # Try to get the member
-            member = self.tar_file.getmember(norm_path)
-            
+            member = self.tar_file.getmember(arc_path)
             return {
                 'size': member.size,
                 'modified': member.mtime,
                 'is_dir': member.isdir(),
-                'path': path
+                'path': arc_path
             }
-                
-        except KeyError:
-            # Check if it's a directory by looking for children
-            for member in self.tar_file.getmembers():
-                if member.name.startswith(norm_path + '/'):
-                    # It's a directory
-                    return {
-                        'size': 0,
-                        'modified': os.path.getmtime(self.path),
-                        'is_dir': True,
-                        'path': path
-                    }
-            
-            # Check in the temporary directory if we're in write mode
-            if self.temp_dir:
-                temp_path = os.path.join(self.temp_dir, norm_path)
-                if os.path.exists(temp_path):
-                    stat = os.stat(temp_path)
-                    return {
-                        'size': stat.st_size,
-                        'modified': stat.st_mtime,
-                        'is_dir': os.path.isdir(temp_path),
-                        'path': path
-                    }
-            
-            # Not found
+        except Exception:
             return None
-    
-    def entry_exists(self, path: str) -> bool:
-        """
-        Check if an entry exists in the TAR.
-        
-        Args:
-            path: Entry path within the TAR
-            
-        Returns:
-            True if the entry exists, False otherwise
-        """
-        return self.get_entry_info(path) is not None
-    
-    def create_dir(self, path: str) -> None:
-        """
-        Create a directory in the TAR.
-        
-        Args:
-            path: Directory path to create
-        """
-        # Normalize directory path to not end with slash
-        norm_path = path.rstrip('/')
-        
-        # Check if the directory already exists
-        if self.entry_exists(norm_path):
-            info = self.get_entry_info(norm_path)
-            if not info['is_dir']:
-                raise NotADirectoryError(f"Path exists but is not a directory: {path}")
-            return
-        
-        # For TAR files, we need to rebuild the archive to add a directory
-        # We'll use the temp directory approach
-        if not self.temp_dir:
-            self.temp_dir = tempfile.mkdtemp()
-        
-        # Create the directory in the temp directory
-        temp_path = os.path.join(self.temp_dir, norm_path)
-        os.makedirs(temp_path, exist_ok=True)
-        
-        # Mark as modified
-        self.modified = True
-    
-    def remove_entry(self, path: str) -> None:
-        """
-        Remove an entry from the TAR.
-        
-        Args:
-            path: Entry path to remove
-        """
-        # Check if the entry exists
-        if not self.entry_exists(path):
-            raise FileNotFoundError(f"Entry not found in TAR: {path}")
-        
-        # TAR files don't support direct removal, so we'll rebuild the archive
-        if not self.temp_dir:
-            self.temp_dir = tempfile.mkdtemp()
-        
-        # Extract all entries except the one to remove
-        for member in self.tar_file.getmembers():
-            # Skip the entry to remove and its children
-            if member.name == path or member.name.startswith(path + '/'):
-                continue
-            
-            # Extract the entry to the temp directory
-            self.tar_file.extract(member, self.temp_dir)
-        
-        # Mark as modified
-        self.modified = True
-    
+
     @classmethod
-    def create_empty(cls, path: str) -> None:
+    def get_supported_extensions(cls):
+        return {'.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz'}
+
+    def open_stream(self, arc_path: str, mode: str = 'r', encoding: str = 'utf-8'):
+        return self.open_member(arc_path, mode, encoding)
+
+    def remove_stream(self, arc_path: str):
+        return self.remove_member(arc_path)
+
+    """
+    Robust TAR handler for ARCFS. All writes go to a temp dir, and the archive is only rebuilt on commit/close.
+    """
+    def __init__(self, path: str, mode: str = 'r', fs=None):
         """
-        Create a new empty TAR archive.
+        Initialize the TAR handler.
+
+        Args:
+            path: Path to the TAR file
+            mode: Access mode
+            fs: ArchiveFS instance (required)
+        """
+        if fs is None:
+            raise ValueError("TarHandler requires an ArchiveFS instance via the 'fs' argument.")
+        self.fs = fs
+        self.path = path
+        self.mode = mode
+        self.tar_file = None
+        self.temp_dir = self.fs.dirs.mkdtemp()
+        self.staged_files: Dict[str, str] = {}   # archive_path -> temp_path
+        self.deleted_files: Set[str] = set()
+        self.modified = False
+        self._open_archive()
+
+    # --- Required abstract methods for ArchiveHandler ---
+    def _open(self, mode: str = 'r'):
+        self.mode = mode
+        self._open_archive()
+
+    def create_dir(self, arc_path: str):
+        temp_dir_path = self.fs.dirs.join(self.temp_dir, arc_path.rstrip('/'))
+        self.fs.dirs.mkdir(temp_dir_path, create_parents=True)
+        self.modified = True
+
+    def member_exists(self, arc_path: str) -> bool:
+        if arc_path in self.deleted_files:
+            return False
+        if arc_path in self.staged_files and self.fs.files.exists(self.staged_files[arc_path]):
+            return True
+        if self.tar_file:
+            try:
+                self.tar_file.getmember(arc_path)
+                return True
+            except KeyError:
+                return False
+        return False
+
+    def get_member_info(self, arc_path: str):
+        if not self.member_exists(arc_path):
+            raise FileNotFoundError(f"Member not found in TAR: {arc_path}")
+        # Return a minimal info dict for compatibility
+        return {'name': arc_path}
+
+    def list_streams(self, dir_path: str = "") -> list:
+        return self.list_dir(dir_path)
+
+    def _open_archive(self):
+        # Open the archive for reading (never writing directly)
+        compression = ''
+        ext = get_archive_format(self.path)
+        if ext.endswith('.gz') or ext.endswith('.tgz'):
+            compression = ':gz'
+        elif ext.endswith('.bz2') or ext.endswith('.tbz2'):
+            compression = ':bz2'
+        elif ext.endswith('.xz') or ext.endswith('.txz'):
+            compression = ':xz'
+        if self.fs.files.exists(self.path):
+            self.tar_file = tarfile.open(self.path, 'r' + compression)
+        else:
+            self.tar_file = None
+
+    def open_member(self, arc_path: str, mode: str = 'r', encoding: str = 'utf-8') -> BinaryIO:
+        """
+        Open an member for reading or writing. Writes/overwrites always go to a temp file.
+        """
+        if 'w' in mode or 'a' in mode:
+            self.modified = True  # Mark archive as modified when opening for write/append
+            # For append, copy existing content if exists
+            buffer = self.fs.files.open(path=None, mode='w+b', buffering=-1, encoding=None)
+            if 'a' in mode and self.tar_file:
+                try:
+                    member = self.tar_file.getmember(arc_path)
+                    with self.tar_file.extractfile(member) as src:
+                        buffer.write(src.read())
+                        buffer.seek(0, io.SEEK_END)
+                except KeyError:
+                    pass
+            self.staged_files[arc_path] = buffer
+
+            return buffer
+        buffer = self.staged_files.get(arc_path)
+        if buffer is not None:
+            buffer.seek(0)
+            return buffer
+        if not self.tar_file:
+            raise FileNotFoundError(f"Archive not found: {self.path}")
+        try:
+            member = self.tar_file.getmember(arc_path)
+            fileobj = self.tar_file.extractfile(member) if not member.isdir() else None
+            if fileobj is None:
+                raise FileNotFoundError(f"Member not found in TAR: {arc_path}")
+            if 'b' in mode:
+                buf = self.fs.files.open(path=None, mode='w+b', buffering=-1, encoding=None)
+                buf.write(fileobj.read())
+                buf.seek(0)
+                return buf
+            else:
+                buf = self.fs.files.open(path=None, mode='w+', buffering=-1, encoding=encoding)
+                buf.write(fileobj.read().decode(encoding))
+                buf.seek(0)
+                return buf
+        except KeyError:
+            raise FileNotFoundError(f"Member not found in TAR: {arc_path}")
+
+    def write(self, arc_path: str, data: Any, encoding: str = 'utf-8'):
+        mode = 'wb' if isinstance(data, bytes) else 'w'
+        with self.open_member(arc_path, mode, encoding=encoding) as f:
+            f.write(data)
+
+    def remove_member(self, arc_path: str):
+        self.deleted_files.add(arc_path)
+        self.modified = True
+        if arc_path in self.staged_files:
+            try:
+                buf = self.staged_files[arc_path]
+                if hasattr(buf, 'close'):
+                    buf.close()
+            except Exception as e:
+                debug_print(f"Exception in TarHandler.remove_member: {e}", level=1, exc=e)
+            del self.staged_files[arc_path]
+
+    def list_dir(self, dir_path: str) -> List[str]:
+        dir_path = dir_path.rstrip('/')
+        streams = set()
+        if self.tar_file:
+            for member in self.tar_file.getmembers():
+                if member.name == dir_path:
+                    continue
+                if not member.name.startswith(dir_path + '/'):
+                    continue
+                rel = member.name[len(dir_path) + 1:]
+                if '/' in rel:
+                    streams.add(rel.split('/', 1)[0])
+                else:
+                    streams.add(rel)
+        for staged in self.staged_files:
+            if staged == dir_path or not staged.startswith(dir_path + '/'):
+                continue
+            rel = staged[len(dir_path) + 1:]
+            if '/' in rel:
+                streams.add(rel.split('/', 1)[0])
+            else:
+                streams.add(rel)
+        for deleted in self.deleted_files:
+            if deleted == dir_path or not deleted.startswith(dir_path + '/'):
+                continue
+            rel = deleted[len(dir_path) + 1:]
+            if '/' in rel:
+                streams.discard(rel.split('/', 1)[0])
+            else:
+                streams.discard(rel)
+        return sorted(streams)
+
+    def close(self):
+        if self.tar_file:
+            self.tar_file.close()
+            self.tar_file = None
+        if self.modified:
+            self._commit()
+        if self.fs.dirs.exists(self.temp_dir):
+            self.fs.dirs.rmdir(self.temp_dir, recursive=True)
+
+    def _commit(self):
+        ext = get_archive_format(self.path)
+        compression = get_tar_compression(ext)
         
+        temp_fd, temp_path = self.fs.files.mkstemp()
+        self.fs.files.close_fd(temp_fd)
+        try:
+            with tarfile.open(temp_path, 'w' + compression) as out_tar:
+                if self.tar_file:
+                    for member in self.tar_file.getmembers():
+                        if member.name in self.deleted_files or member.name in self.staged_files:
+                            continue
+                        fileobj = self.tar_file.extractfile(member) if not member.isdir() else None
+                        out_tar.addfile(member, fileobj)
+                for arc_path, buffer in self.staged_files.items():
+                    if arc_path in self.deleted_files:
+                        continue
+                    arc_name = arc_path.replace('\\', '/')
+                    info = tarfile.TarInfo(arc_name)
+                    buffer.seek(0)
+                    data = buffer.read()
+                    info.size = len(data)
+                    info.mtime = int(time.time())
+                    info.mode = 0o644
+                    buf = self.fs.files.open(path=None, mode='r+b', buffering=-1, encoding=None)
+                    buf.write(data)
+                    buf.seek(0)
+                    out_tar.addfile(info, buf)
+                    buf.close()
+            self.fs.files.move(temp_path, self.path)
+        except Exception as e:
+            debug_print(f"Exception in TarHandler._commit: {e}", level=1, exc=e)
+        finally:
+            if self.fs.files.exists(temp_path):
+                self.fs.files.remove(temp_path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    @classmethod
+    def create_empty(cls, path: str, fs=None) -> None:
+        """
+        Create a new empty TAR archive using the ARCFS API.
         Args:
             path: Path where the TAR should be created
+            fs: ArchiveFS instance providing API access (required)
         """
-        # Determine the mode based on the extension
-        tar_mode = 'w'
-        ext = get_archive_format(path)
-        if ext.endswith('.gz') or ext.endswith('.tgz'):
-            tar_mode += ':gz'
-        elif ext.endswith('.bz2') or ext.endswith('.tbz2'):
-            tar_mode += ':bz2'
-        elif ext.endswith('.xz') or ext.endswith('.txz'):
-            tar_mode += ':xz'
-        
-        # Create parent directory if it doesn't exist
-        parent_dir = os.path.dirname(path)
-        if parent_dir and not os.path.exists(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-        
-        # Create the empty TAR file
-        with tarfile.open(path, tar_mode):
-            pass  # Just create the file
-    
-    @classmethod
-    def get_supported_extensions(cls) -> Set[str]:
-        """
-        Get the file extensions supported by this handler.
-        
-        Returns:
-            Set of supported extensions (with leading dot)
-        """
+        if fs is None:
+            raise ValueError("ArchiveFS instance (fs) must be provided to create_empty.")
+        try:
+            # Determine the mode based on the extension
+            tar_mode = 'w'
+            ext = get_archive_format(path)
+            compression = get_tar_compression(ext)
+            # Create parent directory if it doesn't exist
+            parent_dir = fs.dirs.dirname(path) if hasattr(fs.dirs, 'dirname') else os.path.dirname(path)
+            if parent_dir and not fs.dirs.exists(parent_dir):
+                fs.dirs.mkdir(parent_dir, create_parents=True)
+            # Create the empty TAR file
+            with tarfile.open(path, tar_mode + compression):
+                pass  # Just create the file
+        except Exception as e:
+            debug_print(f"Exception in TarHandler.create_empty: {e}", level=1, exc=e)
+            raise IOError(f"Error creating empty TAR file: {e}")
         return {
             '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz'
         }
+    @property
+    def buffer_size(self):
+        if self._buffer_size is not None:
+            return self._buffer_size
+        try:
+            return getattr(ConfigAPI, 'get_buffer_threshold', lambda: 64*1024)()
+        except Exception:
+            return 64 * 1024
+
+    @buffer_size.setter
+    def buffer_size(self, value):
+        self._buffer_size = value
+
+    @property
+    def temp_dir(self):
+        if self._temp_dir is not None:
+            return self._temp_dir
+        # Could add a config API global for temp_dir if needed, else fallback
+        return '/tmp'
+
+    @temp_dir.setter
+    def temp_dir(self, value):
+        self._temp_dir = value
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        return setattr(self, key, value)
+
+    def __getattr__(self, key):
+        if key in self.__dict__:
+            return self.__dict__[key]
+        raise AttributeError(key)
+
+    def __setattr__(self, key, value):
+        super().__setattr__(key, value)

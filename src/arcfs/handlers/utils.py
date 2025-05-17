@@ -7,6 +7,6 @@ Contact: https://github.com/Munger
 License: MIT
 """
 
-from ..utils import get_archive_format, is_archive_format, get_base_name
+from ..core.utils import get_archive_format, is_archive_format, get_base_name
 
 __all__ = ['get_archive_format', 'is_archive_format', 'get_base_name']
